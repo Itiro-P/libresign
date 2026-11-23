@@ -107,20 +107,64 @@ jobs:
             --admin-pass admin
           ./occ app:enable --force ${{ env.APP_NAME }}
 
+      - name: Debug info
+        run: |
+          echo "::group::Versions"
+          php -v
+          composer --version
+          php -r 'echo "xdebug: ", phpversion("xdebug") ?: "missing", PHP_EOL;'
+          echo "::endgroup::"
+          echo "::group::Runner"
+          nproc
+          free -m
+          df -h .
+          echo "::endgroup::"
+          echo "::group::Nextcloud"
+          ./occ status
+          git -C apps/${{ env.APP_NAME }} log -1 --format='%H %s'
+          echo "::endgroup::"
+
       - name: Infection
         working-directory: apps/${{ env.APP_NAME }}
         env:
           COMPOSER_PROCESS_TIMEOUT: 0
           XDEBUG_MODE: coverage
         run: |
-          set -o pipefail
-          composer mutation:test -- --no-progress --no-interaction 2>&1 | tee infection.log
+          set +e
+          start=$(date +%s)
 
-      - name: Upload Infection log
-        if: failure()
+          composer mutation:test -- \
+            --no-progress --no-interaction \
+            --show-mutations -vvv --log-verbosity=all \
+            --logger-text=infection-text.log \
+            --logger-json=infection.json \
+            2>&1 | tee infection.log
+          status=${PIPESTATUS[0]}
+
+          duration=$(( $(date +%s) - start ))
+          {
+            echo "### Infection (PHP ${{ matrix.php-versions }}, Nextcloud ${{ matrix.server-versions }})"
+            echo "- Commit: \`$(git rev-parse HEAD)\`"
+            echo "- Exit code: \`$status\`"
+            echo "- Duration: \`${duration}s\`"
+            if [ -f infection.json ]; then
+              echo '```json'
+              jq '.stats' infection.json
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit $status
+
+      - name: Upload Infection logs
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: infection-log
-          path: apps/${{ env.APP_NAME }}/infection.log
+          name: infection-php${{ matrix.php-versions }}-nc${{ matrix.server-versions }}
+          path: |
+            apps/${{ env.APP_NAME }}/infection.log
+            apps/${{ env.APP_NAME }}/infection-text.log
+            apps/${{ env.APP_NAME }}/infection.json
+            data/nextcloud.log
           if-no-files-found: ignore
           retention-days: 7
