@@ -3,21 +3,47 @@
 
 name: Infection
 
-on: workflow_dispatch
+run-name: Infection ${{ github.ref_name }} (${{ github.sha }}) scenarios=${{ inputs.scenarios }} base=${{ inputs.diff_base }} on Nextcloud ${{ inputs.nextcloud_version || 'from info.xml' }} and PHP ${{ inputs.php_version || 'from info.xml' }}
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: >-
+          Comma-separated scenario ids, or "all" for the 8 benchmark scenarios.
+          "baseline" (full run, no options) is only included when listed, e.g. "all,baseline".
+        required: true
+        default: all
+      diff_base:
+        description: Git ref or commit used as --git-diff-base by the diff scenarios (e.g. the PR merge-base SHA).
+        required: true
+        default: origin/main
+      threads:
+        description: Value for --threads, equal in every scenario. Empty does not pass the option.
+        required: false
+        default: '1'
+      nextcloud_version:
+        description: Nextcloud server version (branch or tag, e.g. stable31). Empty uses info.xml.
+        required: false
+        default: ''
+      php_version:
+        description: PHP version (e.g. 8.3). Empty uses info.xml.
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: infection-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  group: infection-${{ github.ref }}-nc${{ inputs.nextcloud_version }}-php${{ inputs.php_version }}-${{ inputs.diff_base }}-${{ inputs.scenarios }}
+  cancel-in-progress: false
 
 jobs:
   matrix:
     runs-on: ubuntu-latest
     outputs:
-      php-version: ${{ steps.versions.outputs.php-available-list }}
-      server-max: ${{ steps.versions.outputs.branches-max-list }}
+      php-version: ${{ inputs.php_version && format('["{0}"]', inputs.php_version) || steps.versions.outputs.php-available-list }}
+      server-max: ${{ inputs.nextcloud_version && format('["{0}"]', inputs.nextcloud_version) || steps.versions.outputs.branches-max-list }}
+      scenarios: ${{ steps.scenarios.outputs.list }}
     steps:
       - name: Checkout app
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -28,44 +54,52 @@ jobs:
         id: versions
         uses: icewind1991/nextcloud-version-matrix@cd0211ffcef1065e2020cd579e4843b8746e7a58 # v1.3.3
 
-  changes:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
+      - name: Select scenarios
+        id: scenarios
+        env:
+          SELECTED: ${{ inputs.scenarios }}
+        run: |
+          # id: scenario name; args: Infection options; diff: needs --git-diff-base; core: part of "all"
+          all='[
+            {"id":"baseline","args":"","diff":false,"core":false},
+            {"id":"diff-filter","args":"--git-diff-filter=AM","diff":true,"core":true},
+            {"id":"diff-lines","args":"--git-diff-lines","diff":true,"core":true},
+            {"id":"covering-tests","args":"--only-covering-test-cases","diff":false,"core":true},
+            {"id":"with-uncovered","args":"--with-uncovered","diff":false,"core":true},
+            {"id":"map-class","args":"--map-source-class-to-test","diff":false,"core":true},
+            {"id":"map-class-diff-filter","args":"--map-source-class-to-test --git-diff-filter=AM","diff":true,"core":true},
+            {"id":"map-class-diff-lines","args":"--map-source-class-to-test --git-diff-lines","diff":true,"core":true},
+            {"id":"map-class-covering","args":"--map-source-class-to-test --only-covering-test-cases","diff":false,"core":true}
+          ]'
 
-    outputs:
-      src: ${{ steps.changes.outputs.src}}
+          list=$(jq -c --arg sel "$SELECTED" '
+            ($sel | split(",") | map(gsub("\\s"; "")) | map(select(length > 0))) as $ids
+            | [ .[] | select(
+                (.id as $i | $ids | any(. == $i))
+                or (($ids | any(. == "all")) and .core)
+              ) ]
+          ' <<<"$all")
 
-    steps:
-      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
-        id: changes
-        continue-on-error: true
-        with:
-          filters: |
-            src:
-              - '.github/workflows/infection.yml'
-              - 'appinfo/**'
-              - 'lib/**'
-              - 'templates/**'
-              - 'tests/**'
-              - '3rdparty/**'
-              - 'vendor-bin/**'
-              - 'infection.json5'
-              - 'composer.json'
-              - 'composer.lock'
+          if [ "$(jq length <<<"$list")" -eq 0 ]; then
+            echo "::error::No scenario matched '$SELECTED'"
+            exit 1
+          fi
+          echo "Selected: $(jq -r 'map(.id) | join(", ")' <<<"$list")"
+          echo "list=$list" >> "$GITHUB_OUTPUT"
 
   infection:
+    name: ${{ matrix.scenario.id }} (PHP ${{ matrix.php-versions }}, NC ${{ matrix.server-versions }})
     runs-on: ubuntu-latest
-    needs: [changes, matrix]
-    if: needs.changes.outputs.src != 'false'
+    needs: matrix
     env:
       APP_NAME: libresign
 
     strategy:
+      fail-fast: false
       matrix:
         php-versions: ${{ fromJson(needs.matrix.outputs.php-version) }}
         server-versions: ${{ fromJson(needs.matrix.outputs.server-max) }}
+        scenario: ${{ fromJson(needs.matrix.outputs.scenarios) }}
 
     steps:
       - name: Checkout server
@@ -82,6 +116,8 @@ jobs:
           persist-credentials: false
           submodules: true
           path: apps/${{ env.APP_NAME }}
+          # Full history: --git-diff-base needs to resolve the base commit/ref.
+          fetch-depth: 0
 
       - name: Set up PHP ${{ matrix.php-versions }}
         uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
@@ -120,20 +156,118 @@ jobs:
             --admin-pass admin
           ./occ app:enable --force ${{ env.APP_NAME }}
 
-      - name: Infection
+      - name: Debug info
+        run: |
+          echo "::group::Versions"
+          php -v
+          composer --version
+          php -r 'echo "xdebug: ", phpversion("xdebug") ?: "missing", PHP_EOL;'
+          echo "::endgroup::"
+          echo "::group::Runner"
+          nproc
+          free -m
+          df -h .
+          echo "::endgroup::"
+          echo "::group::Nextcloud"
+          ./occ status
+          git -C apps/${{ env.APP_NAME }} log -1 --format='%H %s'
+          echo "::endgroup::"
+
+      - name: Infection (${{ matrix.scenario.id }})
         working-directory: apps/${{ env.APP_NAME }}
         env:
           COMPOSER_PROCESS_TIMEOUT: 0
           XDEBUG_MODE: coverage
+          SCENARIO_ID: ${{ matrix.scenario.id }}
+          SCENARIO_ARGS: ${{ matrix.scenario.args }}
+          SCENARIO_DIFF: ${{ matrix.scenario.diff }}
+          DIFF_BASE: ${{ inputs.diff_base }}
+          THREADS: ${{ inputs.threads }}
         run: |
-          set -o pipefail
-          composer mutation:test -- --no-progress --no-interaction 2>&1 | tee infection.log
+          set +e
 
-      - name: Upload Infection log
-        if: failure()
+          args="$SCENARIO_ARGS"
+          base_sha=""
+          if [ "$SCENARIO_DIFF" = "true" ]; then
+            base_sha=$(git rev-parse --verify --quiet "${DIFF_BASE}^{commit}")
+            if [ -z "$base_sha" ]; then
+              echo "::error::diff_base '$DIFF_BASE' does not resolve to a commit in this checkout"
+              exit 1
+            fi
+            args="$args --git-diff-base=$base_sha"
+          fi
+          if [ -n "$THREADS" ]; then
+            args="$args --threads=$THREADS"
+          fi
+          echo "Scenario: $SCENARIO_ID"
+          echo "Infection args: $args"
+
+          start=$(date +%s)
+
+          # $args is intentionally unquoted so it is split into separate options.
+          # shellcheck disable=SC2086
+          composer mutation:test -- \
+            $args \
+            --no-progress --no-interaction \
+            --show-mutations -vvv --log-verbosity=all \
+            --logger-text=infection-text.log \
+            --logger-summary-json=infection.json \
+            2>&1 | tee infection.log
+          status=${PIPESTATUS[0]}
+
+          duration=$(( $(date +%s) - start ))
+
+          total=""
+          if [ -f infection.json ]; then
+            total=$(jq '.stats.totalMutantsCount // 0' infection.json)
+          fi
+
+          jq -n \
+            --arg scenario "$SCENARIO_ID" \
+            --arg args "$args" \
+            --arg base "$DIFF_BASE" \
+            --arg base_sha "$base_sha" \
+            --arg commit "$(git rev-parse HEAD)" \
+            --arg php "${{ matrix.php-versions }}" \
+            --arg nc "${{ matrix.server-versions }}" \
+            --argjson status "$status" \
+            --argjson duration "$duration" \
+            --arg total "$total" \
+            '{scenario:$scenario, args:$args, diff_base:$base, diff_base_sha:$base_sha, commit:$commit,
+              php:$php, nextcloud:$nc, exit_code:$status, duration_seconds:$duration,
+              total_mutants:(if $total == "" then null else ($total|tonumber) end)}' \
+            > scenario-meta.json
+
+          {
+            echo "### Infection: ${SCENARIO_ID} (PHP ${{ matrix.php-versions }}, Nextcloud ${{ matrix.server-versions }})"
+            echo "- Commit: \`$(git rev-parse HEAD)\`"
+            echo "- Options: \`$args\`"
+            echo "- Exit code: \`$status\`"
+            echo "- Duration: \`${duration}s\`"
+            if [ -z "$total" ]; then
+              echo "- No infection.json produced: this run is **not** evidence of mutation protection."
+            elif [ "$total" -eq 0 ]; then
+              echo "- **Zero mutants selected**: a green run here is **not** evidence of adequate mutation protection."
+            fi
+            if [ -f infection.json ]; then
+              echo '```json'
+              jq '.stats' infection.json
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit $status
+
+      - name: Upload Infection logs
+        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: infection-log
-          path: apps/${{ env.APP_NAME }}/infection.log
+          name: infection-${{ matrix.scenario.id }}-php${{ matrix.php-versions }}-nc${{ matrix.server-versions }}
+          path: |
+            apps/${{ env.APP_NAME }}/infection.log
+            apps/${{ env.APP_NAME }}/infection-text.log
+            apps/${{ env.APP_NAME }}/infection.json
+            apps/${{ env.APP_NAME }}/scenario-meta.json
+            data/nextcloud.log
           if-no-files-found: ignore
           retention-days: 7
