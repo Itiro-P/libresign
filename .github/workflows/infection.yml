@@ -211,7 +211,7 @@ jobs:
             --no-progress --no-interaction \
             --show-mutations -vvv --log-verbosity=all \
             --logger-text=infection-text.log \
-            --logger-json=infection.json \
+            --logger-summary-json=infection.json \
             2>&1 | tee infection.log
           status=${PIPESTATUS[0]}
 
